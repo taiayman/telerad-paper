@@ -64,7 +64,7 @@
 
 <section class="abstract">
   <h2>Abstract</h2>
-  <p>Chest radiographs make up most of the volume in teleradiology, and most of it is read under time pressure, far from the clinic that took the image. We describe Telerad, a teleradiology system built to run on a single CPU-only laptop over a capped 4G link, and its reading agent: a general-purpose vision-language model that does not see the full-resolution film at once but has to work through it with tools. It must first identify what the image is and correct its orientation, then inspect nine anatomical zones with region crops at chosen contrast windows, record a finding for each zone, measure the cardiothoracic ratio and see its own measurement drawn back on the image, and only then output probabilities for the 14 CheXpert observations and a French report. A triple-reading mode runs three independent agents and an arbiter that keeps only concordant findings and labels single-reader findings as discordant. The radiologist reviews, edits and signs; nothing reaches the clinic without a signature. On a robustness suite of eight inputs built from one public radiograph (original, mirrored, rotated, downsampled, blank, noise, CT slice, document photo), the single-reader agent handled all eight as expected, corrected both orientation faults and declined to read the four non-radiographs, at a mean of 86 s and US$0.069 per chest film. Triple reading surfaced findings the single reader had called normal, but also failed our checklist-completeness check in two of four cases. We have not yet measured diagnostic accuracy: the protocol for a comparison against three board-certified radiologists on the 500-study CheXpert test set is implemented and described here, and its results will be reported separately.</p>
+  <p>Chest radiographs make up most of the volume in teleradiology, and most of it is read under time pressure, far from the clinic that took the image. We describe Telerad, a teleradiology system for low-resource settings, and its reading agent: a general-purpose vision-language model that, without any task-specific training, reads a radiograph the way a radiologist is taught to. It never sees the full-resolution film at once; it has to work through it with tools. It must first identify what the image is and correct its orientation, then inspect nine anatomical zones with region crops at chosen contrast windows, record a finding for each zone, measure the cardiothoracic ratio and see its own measurement drawn back on the image, and only then output probabilities for the 14 CheXpert observations and a French report. A triple-reading mode runs three independent agents and an arbiter that keeps only concordant findings and labels single-reader findings as discordant. The radiologist reviews, edits and signs; nothing reaches the clinic without a signature. On a robustness suite of eight inputs built from one public radiograph (original, mirrored, rotated, downsampled, blank, noise, CT slice, document photo), the single-reader agent handled all eight as expected, corrected both orientation faults and declined to read the four non-radiographs, at a mean of 86 s and US$0.069 per chest film. Triple reading surfaced findings the single reader had called normal, but also failed our checklist-completeness check in two of four cases. We have not yet measured diagnostic accuracy: the protocol for a comparison against three board-certified radiologists on the 500-study CheXpert test set is implemented and described here, and its results will be reported separately.</p>
 </section>
 
 <p class="note">Research prototype. Not a certified medical device and not for clinical use. All images are public, de-identified research data. Every AI output in the system is a draft that a radiologist must sign.</p>
@@ -72,68 +72,93 @@
 <h2 id="intro">1. Introduction</h2>
 <p>Image classifiers for chest radiographs have reported radiologist-level performance on several findings for some years <a class="cite" href="#r1">[1]</a>, <a class="cite" href="#r2">[2]</a>. In practice they arrive in a reading workflow as a list of scores with no account of how they were reached, and a radiologist has no cheap way to check a score other than reading the film again. The reading itself, meanwhile, is a procedure: radiologists are trained to go through the film zone by zone so that the obvious finding does not hide the second one.</p>
 <p>General-purpose vision-language models can now call tools, look at an image, act, and look again <a class="cite" href="#r6">[6]</a>. This makes it possible to impose that procedure on the model instead of asking it for an answer in one pass. The model has to say what it is looking at, ask for a region, choose a contrast window, write down what it saw, and measure. Every one of those steps is an event that can be logged and replayed on top of the image in the radiologist's viewer, so the radiologist sees where the agent looked and what it concluded at each place.</p>
-<p>We built this agent inside a complete teleradiology prototype aimed at a setting with few resources: clinics in Morocco sending images to a remote radiologist, a single laptop with no GPU as the server, and a mobile data budget of about 4&nbsp;GB a day. This report describes the system, the agent, and the controls around it, and reports the first evaluation we have run, which tests behaviour and robustness rather than diagnostic accuracy.</p>
+<p>The agent receives no radiograph-specific training. Everything it does well comes from the procedure the tools impose and from the feedback each tool returns: a crop it asked for, a measurement drawn back on the film, a refusal to conclude while zones remain unread. Within a single reading it adjusts its windows zone by zone, corrects its own measurements and revisits what it skipped. We built it inside a complete teleradiology prototype for clinics in Morocco that send images to remote radiologists, a setting with little bandwidth and no dedicated hardware. This report describes the agent and the workflow around it, and the first evaluation we have run, which tests behaviour and robustness rather than diagnostic accuracy.</p>
 <p>Our contributions are:</p>
 <ol>
   <li>A reading agent that enforces a systematic nine-zone chest radiograph reading through tool constraints, with orientation correction, ruler-annotated crops, self-checked measurement and a local classifier available as a second opinion.</li>
   <li>A triple-reading mode with an arbiter that keeps concordant findings and reports single-reader findings as discordant instead of affirming or discarding them.</li>
-  <li>A teleradiology pipeline around it (de-identification on upload, prioritised worklist, pre-sign consistency checks, audited signing and delivery) that runs natively on commodity CPU hardware.</li>
+  <li>A teleradiology pipeline around it (de-identification on upload, prioritised worklist, pre-sign consistency checks, audited signing and delivery) designed for low-resource deployment.</li>
   <li>A robustness suite for reading agents and its results, and an implemented protocol for comparison with radiologists on the CheXpert test set.</li>
 </ol>
 
-<h2 id="system">2. System overview</h2>
-<p>The system has three processes we wrote (a React web client, a FastAPI service, a Python worker) and two we installed (PostgreSQL&nbsp;16 and Orthanc <a class="cite" href="#r7">[7]</a> as the DICOM store). It runs natively on Windows on an Intel i7-8650U with 16&nbsp;GB of RAM and no discrete GPU. There is no container runtime, message broker or cache.</p>
+<h2 id="system">2. Workflow</h2>
+<p>Telerad covers the path of a study from the clinic to the signed report (Figure 1). A study is de-identified on arrival, pre-read by image models that set its priority, read by the agent and a radiologist together, checked, signed and returned to the clinic. The reading agent sits at the centre of this path; the rest exists so that its output reaches a patient file only through a radiologist's signature.</p>
 <figure>
-<svg viewBox="0 0 760 330" role="img" aria-label="System architecture: clinic upload, de-identification, Orthanc and PostgreSQL, worker pre-read, radiologist workstation with the reading agent, signing and delivery.">
-  <defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#333"/></marker></defs>
-  <g font-family="Source Serif 4, Georgia, serif" font-size="13" fill="#111">
-    <rect x="10" y="20" width="150" height="58" rx="6" fill="#f6f6f4" stroke="#333"/>
-    <text x="85" y="44" text-anchor="middle" font-weight="600">Clinic</text><text x="85" y="62" text-anchor="middle" font-size="12">DICOM upload</text>
-    <rect x="215" y="20" width="170" height="58" rx="6" fill="#fff" stroke="#333"/>
-    <text x="300" y="44" text-anchor="middle" font-weight="600">API (FastAPI)</text><text x="300" y="62" text-anchor="middle" font-size="12">de-identification, roles, audit</text>
-    <rect x="440" y="20" width="140" height="58" rx="6" fill="#fff" stroke="#333"/>
-    <text x="510" y="44" text-anchor="middle" font-weight="600">Orthanc</text><text x="510" y="62" text-anchor="middle" font-size="12">DICOM, localhost only</text>
-    <rect x="610" y="20" width="140" height="58" rx="6" fill="#fff" stroke="#333"/>
-    <text x="680" y="44" text-anchor="middle" font-weight="600">PostgreSQL</text><text x="680" y="62" text-anchor="middle" font-size="12">exams, reports, jobs</text>
-    <rect x="215" y="130" width="535" height="70" rx="6" fill="#f6f6f4" stroke="#333"/>
-    <text x="482" y="153" text-anchor="middle" font-weight="600">Worker (CPU): pre-read</text>
-    <text x="482" y="172" text-anchor="middle" font-size="12">TorchXRayVision scores · TotalSegmentator (CT) · indication triage · urgency score · French draft</text>
-    <text x="482" y="189" text-anchor="middle" font-size="12">jobs claimed with SELECT … FOR UPDATE SKIP LOCKED, retries and backoff</text>
-    <rect x="10" y="250" width="380" height="64" rx="6" fill="#fff" stroke="#333"/>
-    <text x="200" y="274" text-anchor="middle" font-weight="600">Radiologist workstation</text>
-    <text x="200" y="293" text-anchor="middle" font-size="12">worklist by urgency and SLA · viewer · reading agent · dictation</text>
-    <rect x="450" y="250" width="300" height="64" rx="6" fill="#fff" stroke="#333"/>
-    <text x="600" y="274" text-anchor="middle" font-weight="600">Sign and deliver</text>
-    <text x="600" y="293" text-anchor="middle" font-size="12">consistency checks · signature · report to clinic</text>
+<svg viewBox="0 0 760 112" role="img" aria-label="Workflow: clinic upload, de-identification, AI pre-read and triage, reading agent with radiologist, signed report to the clinic.">
+  <defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#333"/></marker></defs>
+  <g font-family="Source Serif 4, Georgia, serif" fill="#111" text-anchor="middle">
+    <g stroke="#333" stroke-width="1.2">
+      <rect x="2" y="24" width="128" height="64" rx="8" fill="#fff"/>
+      <rect x="160" y="24" width="128" height="64" rx="8" fill="#fff"/>
+      <rect x="318" y="24" width="128" height="64" rx="8" fill="#fff"/>
+      <rect x="476" y="24" width="128" height="64" rx="8" fill="#fbeee8" stroke="#b24a2c" stroke-width="1.6"/>
+      <rect x="634" y="24" width="124" height="64" rx="8" fill="#fff"/>
+    </g>
+    <g font-size="14" font-weight="600">
+      <text x="66" y="52">Clinic</text><text x="224" y="52">De-identification</text><text x="382" y="52">Pre-read</text>
+      <text x="540" y="52">Reading agent</text><text x="696" y="52">Signed report</text>
+    </g>
+    <g font-size="12" fill="#444">
+      <text x="66" y="71">DICOM upload</text><text x="224" y="71">DICOM PS3.15</text><text x="382" y="71">triage, priority</text>
+      <text x="540" y="71">+ radiologist</text><text x="696" y="71">to the clinic</text>
+    </g>
     <g stroke="#333" stroke-width="1.3" fill="none" marker-end="url(#a)">
-      <path d="M160 49H213"/><path d="M385 49H438"/><path d="M580 49H608"/>
-      <path d="M680 78V128"/><path d="M510 78V128"/>
-      <path d="M300 200V230H200V248"/>
-      <path d="M390 282H448"/>
+      <path d="M131 56H157"/><path d="M289 56H315"/><path d="M447 56H473"/><path d="M605 56H631"/>
     </g>
   </g>
 </svg>
-<figcaption><b>Figure 1.</b> Architecture. The browser never talks to Orthanc: every image request goes through the API, which checks the role and assignment and writes an audit row.</figcaption>
+<figcaption><b>Figure 1.</b> Path of a study. Nothing reaches the clinic without a radiologist's signature.</figcaption>
 </figure>
 
-<h3>2.1 Intake and de-identification</h3>
-<p>Studies are de-identified at upload, before anything is stored, by applying the tag list of the DICOM PS3.15 Basic Application Level Confidentiality Profile <a class="cite" href="#r8">[8]</a>: identifying attributes are removed or replaced, private tags are dropped, UIDs are remapped, and files declaring burned-in annotations are rejected. Patient sex and age are kept because they change the reading.</p>
+<h3>2.1 De-identification</h3>
+<p>Studies are de-identified on arrival, before anything is written to the DICOM archive (Orthanc <a class="cite" href="#r7">[7]</a>), with the tag list of the DICOM PS3.15 Basic Application Level Confidentiality Profile <a class="cite" href="#r8">[8]</a>: identifying attributes are removed or replaced, private tags are dropped, UIDs are remapped, and files declaring burned-in annotations are rejected. Patient sex and age are kept because they change the reading.</p>
 
 <h3>2.2 Pre-read and prioritisation</h3>
-<p>Each new exam enqueues a job in a PostgreSQL table that workers claim with <code>FOR UPDATE SKIP LOCKED</code>. For radiographs the worker runs the TorchXRayVision DenseNet (<code>densenet121-res224-all</code>) <a class="cite" href="#r3">[3]</a>; for CT it runs TotalSegmentator in its fast 3&nbsp;mm mode <a class="cite" href="#r4">[4]</a>, which takes about a minute per scan on CPU and produces a DICOM SEG overlay and organ volumes. Neither model was trained or fine-tuned by us. The clinic's free-text indication is classified by a language model as routine, urgent or critical, with a keyword fallback.</p>
+<p>Every new study is pre-read in the background. Radiographs go through the TorchXRayVision DenseNet (<code>densenet121-res224-all</code>) <a class="cite" href="#r3">[3]</a>; CT studies go through TotalSegmentator <a class="cite" href="#r4">[4]</a>, which produces an organ segmentation overlay and volumes. Both are used as published. The clinic's free-text indication is classified as routine, urgent or critical by a language model, with a keyword fallback.</p>
 <p>The urgency score is a set of plain rules so that every point on the worklist has a reason the radiologist can read:</p>
 <p class="eq">score = 30·[flagged urgent] + 40·[critical indication] + 20·[urgent indication] + Σ<sub>k</sub> w<sub>k</sub>·[p<sub>k</sub> ≥ 0.6], capped at 100,</p>
-<p>with w = 40 for pneumothorax and 10–15 for effusion, consolidation, oedema and mass. The 0.6 threshold sits above the classifier's calibrated operating point of 0.5, where it is effectively guessing. The score sets the turnaround promised to the clinic: 30 minutes at 70 and above, 60 minutes for urgent exams or scores of 40 and above, four hours otherwise. If any AI step fails, the exam still reaches the worklist with the clinic flag and waiting time.</p>
+<p>with w = 40 for pneumothorax and 10–15 for effusion, consolidation, oedema and mass. The 0.6 threshold sits above the classifier's operating point of 0.5, where it is effectively guessing. The score sets the turnaround promised to the clinic: 30 minutes at 70 and above, 60 minutes for urgent exams or scores of 40 and above, four hours otherwise.</p>
 
 <h3>2.3 Review, checks and signing</h3>
-<p>The workstation (Figure 2) is built on Cornerstone3D <a class="cite" href="#r5">[5]</a> and shows the film on a free canvas with the report beside it. Before signing, deterministic checks run on the report text. They block signing when the conclusion or results are empty, when template placeholders remain, or when the conclusion names a side (right or left) that the results never describe. They raise a warning, which the radiologist must acknowledge explicitly, when the indication and conclusion name different sides, when the classifier reports pneumothorax at p ≥ 0.6 and the conclusion does not mention it, or when the AI draft was signed without a single edit. A signed report is delivered to the clinic in the same database transaction and can also be sent by e-mail. Every login, exam opening, image fetch, edit and signature is written to an append-only audit table.</p>
+<p>The radiologist reads on a workstation built on Cornerstone3D <a class="cite" href="#r5">[5]</a>, with the film beside the report (Figure 2) and the agent's reading replayed over the film. Before signing, deterministic checks run on the report text. They block signing when the conclusion or results are empty, when template placeholders remain, or when the conclusion names a side that the results never describe. They raise a warning that must be acknowledged when the indication and conclusion name different sides, when the classifier reports pneumothorax at p ≥ 0.6 and the conclusion does not mention it, or when an AI draft is signed without a single edit. Every opening, edit and signature is written to an append-only audit log.</p>
 <figure>
 <img src="fig/workstation.jpg" alt="The radiologist workstation: tool rail on the left, chest radiograph in the centre, report panel with indication, technique and results on the right." loading="lazy" width="1400" height="664">
 <figcaption><b>Figure 2.</b> Radiologist workstation showing a portable chest radiograph from the public COVID-19-AR collection <a class="cite" href="#r10">[10]</a>. Image tools on the left and over the film, report on the right.</figcaption>
 </figure>
 
 <h2 id="method">3. The reading agent</h2>
-<p>The agent is a loop around a hosted vision-language model, accessed through OpenRouter and selected by configuration, so the same code runs with different models. It is given a system prompt that describes the systematic reading expected of a senior thoracic radiologist, the clinical context (indication, age, sex) and a 1024-pixel overview of the film with graduated rulers in the margins. It then acts only through six tools (Table 1). Sampling temperature is 0 and the loop is capped at 22 model turns.</p>
+<p>The agent is a loop around a hosted general-purpose vision-language model. The loop is model-agnostic: the model is a configuration value, and nothing in the agent is specific to one provider. It is given a system prompt that describes the systematic reading expected of a senior thoracic radiologist, the clinical context (indication, age, sex) and a 1024-pixel overview of the film with graduated rulers in the margins. It then acts only through six tools (Table 1). Sampling temperature is 0 and the loop is capped at 22 model turns.</p>
+
+<figure>
+<svg viewBox="0 0 760 196" role="img" aria-label="Reading loop: identify and orient, look at a zone with a chosen window, note the zone, measure and verify, conclude. Notes loop back to the next zone, measurements loop back when an endpoint is off, and concluding is refused until all nine zones are noted.">
+  <defs><marker id="b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#333"/></marker>
+        <marker id="c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#b24a2c"/></marker></defs>
+  <g font-family="Source Serif 4, Georgia, serif" fill="#111" text-anchor="middle">
+    <g stroke="#333" stroke-width="1.2" fill="#fff">
+      <rect x="2" y="64" width="128" height="64" rx="8"/><rect x="160" y="64" width="128" height="64" rx="8"/>
+      <rect x="318" y="64" width="128" height="64" rx="8"/><rect x="476" y="64" width="128" height="64" rx="8"/>
+      <rect x="634" y="64" width="124" height="64" rx="8" fill="#fbeee8" stroke="#b24a2c" stroke-width="1.6"/>
+    </g>
+    <g font-size="14" font-weight="600">
+      <text x="66" y="92">Identify</text><text x="224" y="92">Look</text><text x="382" y="92">Note</text><text x="540" y="92">Measure</text><text x="696" y="92">Conclude</text>
+    </g>
+    <g font-size="12" fill="#444">
+      <text x="66" y="111">kind, view, orient</text><text x="224" y="111">zoom + window</text><text x="382" y="111">one zone, one line</text><text x="540" y="111">drawn back, checked</text><text x="696" y="111">14 probs + report</text>
+    </g>
+    <g stroke="#333" stroke-width="1.3" fill="none" marker-end="url(#b)">
+      <path d="M131 96H157"/><path d="M289 96H315"/><path d="M447 96H473"/><path d="M605 96H631"/>
+      <path d="M382 63C382 26 224 26 224 61"/>
+      <path d="M560 63C580 34 520 34 534 61"/>
+    </g>
+    <path d="M696 129C696 176 224 176 224 131" stroke="#b24a2c" stroke-width="1.3" stroke-dasharray="5 4" fill="none" marker-end="url(#c)"/>
+    <g font-size="12" fill="#333">
+      <text x="303" y="22">next zone (9 in all)</text><text x="550" y="26">re-measure if off</text>
+    </g>
+    <text x="460" y="190" font-size="12" fill="#b24a2c">refused while any zone is unread</text>
+  </g>
+</svg>
+<figcaption><b>Figure 3.</b> The reading loop. Black arrows are the agent's own choices; the dashed arrow is the constraint the system enforces. Every step is streamed to the radiologist's viewer and drawn over the film.</figcaption>
+</figure>
 
 <div class="scroll">
 <table>
@@ -167,13 +192,16 @@
 <h3>3.5 Triple reading</h3>
 <p>In consensus mode three agents read the same film independently and in parallel. An arbiter call then receives the overview and the three readings (zone notes, reports, probabilities) and writes the final report under fixed rules: a finding is stated only if at least two readers report it concordantly, on the same side; a potentially serious finding (pneumothorax, effusion, consolidation, mass, misplaced device) seen by one reader is neither stated nor dropped but reported as a discordance to be verified; no finding may be added that no reader made; measurements take the median. The output probabilities are the per-observation median of the three readers.</p>
 
+<h3>3.6 Adapting within a reading</h3>
+<p>The model's weights are never updated; what changes during a reading is what the agent has seen and been told. Four kinds of feedback shape it. An orientation fix re-renders the film, and every later step works on the corrected image. Each crop comes back in the window the agent chose, so it can read the apices in a lung window, the heart in a mediastinal window and the ribs in a bone window, and ask again with another window if a structure is unclear. Each measurement comes back drawn on the film, so the agent can see an endpoint that missed the cardiac border and place it again. A premature conclusion is refused with the list of zones still unread, and the agent goes back to them. None of this carries over to the next study: every reading starts from the same instructions, which keeps readings independent and is what makes triple reading meaningful.</p>
+
 <h2 id="experiments">4. Experiments</h2>
 
 <h3>4.1 Robustness suite</h3>
-<p>A reading agent in a teleradiology queue will be sent things that are not clean frontal chest films. We built eight inputs from one public portable AP chest radiograph and one public CT study (Figure 3): the original film; the film mirrored, rotated by 90° and downsampled; a blank image; uniform noise; an axial CT slice; and the photo of a text document. Each case has explicit pass criteria. For the four chest variants: correct identification, all nine zones noted, the right orientation fix (none on the original, the mirror fix on the mirrored film, a rotation on the rotated one). For the blank and noise images: identified as unreadable or non-radiograph, with no pathology probability above 0.2. For the CT slice and the document: identified as such. For all four non-chest inputs: no fabricated "normal" nine-zone reading. We also checked consistency across the four versions of the same film: a finding counts as flipping if one version gives p ≥ 0.5 and another p &lt; 0.2.</p>
+<p>A reading agent in a teleradiology queue will be sent things that are not clean frontal chest films. We built eight inputs from one public portable AP chest radiograph and one public CT study (Figure 4): the original film; the film mirrored, rotated by 90° and downsampled; a blank image; uniform noise; an axial CT slice; and the photo of a text document. Each case has explicit pass criteria. For the four chest variants: correct identification, all nine zones noted, the right orientation fix (none on the original, the mirror fix on the mirrored film, a rotation on the rotated one). For the blank and noise images: identified as unreadable or non-radiograph, with no pathology probability above 0.2. For the CT slice and the document: identified as such. For all four non-chest inputs: no fabricated "normal" nine-zone reading. We also checked consistency across the four versions of the same film: a finding counts as flipping if one version gives p ≥ 0.5 and another p &lt; 0.2.</p>
 <figure>
 <img src="fig/stress_inputs.png" alt="Eight test inputs: chest radiograph original, mirrored, rotated 90 degrees, low resolution; blank image; noise; CT slice; document photo." loading="lazy" width="1064" height="528">
-<figcaption><b>Figure 3.</b> Robustness inputs. Top row: (a) original portable AP film, (b) mirrored, (c) rotated 90°, (d) downsampled. Bottom row: (e) blank, (f) noise, (g) axial CT slice, (h) document photo. Sources: COVID-19-AR <a class="cite" href="#r10">[10]</a> and LIDC-IDRI <a class="cite" href="#r11">[11]</a> via TCIA <a class="cite" href="#r9">[9]</a>.</figcaption>
+<figcaption><b>Figure 4.</b> Robustness inputs. Top row: (a) original portable AP film, (b) mirrored, (c) rotated 90°, (d) downsampled. Bottom row: (e) blank, (f) noise, (g) axial CT slice, (h) document photo. Sources: COVID-19-AR <a class="cite" href="#r10">[10]</a> and LIDC-IDRI <a class="cite" href="#r11">[11]</a> via TCIA <a class="cite" href="#r9">[9]</a>.</figcaption>
 </figure>
 
 <h3>4.2 Results: single reader</h3>
@@ -231,7 +259,7 @@
 </ul>
 
 <h2 id="conclusion">7. Conclusion</h2>
-<p>We built a teleradiology prototype that runs on a CPU-only laptop and a reading agent that reads chest radiographs the way radiologists are taught to: identify, orient, go through every zone, measure, then conclude. Each step is visible to the radiologist who signs. On a robustness suite the single-reader agent behaved correctly on all eight inputs, including rotated and mirrored films and four inputs it had to refuse. Triple reading found more on the same film and flagged its disagreements as intended, but was slower and less complete. The next step is the measurement that matters: sensitivity and specificity against three board-certified radiologists on the 500-study CheXpert test set.</p>
+<p>We built a reading agent that, with no task-specific training, reads chest radiographs the way radiologists are taught to: identify, orient, go through every zone, measure, then conclude. Each step is visible to the radiologist who signs. On a robustness suite the single-reader agent behaved correctly on all eight inputs, including rotated and mirrored films and four inputs it had to refuse. Triple reading found more on the same film and flagged its disagreements as intended, but was slower and less complete. The next step is the measurement that matters: sensitivity and specificity against three board-certified radiologists on the 500-study CheXpert test set.</p>
 
 <hr>
 <h2 id="references">References</h2>
